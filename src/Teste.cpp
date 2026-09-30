@@ -1,25 +1,28 @@
 #include <Arduino.h>
 #include "esp32s3_dsp.h" 
-#include "esp_heap_caps.h" // Necessário para usar a memória externa (PSRAM)
+#include "esp_heap_caps.h"
 
-// Configurações base do sistema
-#define FFT_SIZE            1024   // Resolução do espectro (deve ser potência de 2)
-#define FFT_SAMPLES         1024   // Amostras por ciclo
-#define TAXA_AMOSTRAGEM     4000.0 // Frequência de leitura dos sensores (4 kHz)
+// --- Hardware e Tempo Discreto ---
+#define PINO_SENSOR_CORRENTE 34    // Pino ADC para ler a tensão do SCT-013
+#define FFT_SIZE             1024  // Tamanho do vetor da FFT
+#define FFT_SAMPLES          1024  // Quantidade de leituras por ciclo
+#define TAXA_AMOSTRAGEM      4000.0 // Frequência de amostragem (fs) em Hz
 
-// Instâncias da biblioteca matemática
+// Na teoria de sistemas de tempo discreto, o período de amostragem (Ts) é 1/fs.
+// Para 4000 Hz, precisamos ler os sensores exatamente a cada 250 microssegundos.
+const int PERIODO_AMOSTRAGEM_US = (1.0 / TAXA_AMOSTRAGEM) * 1000000;
+
+// --- Instâncias DSP ---
 ESP32S3_FFT fft_vibracao;
 ESP32S3_FFT fft_corrente;
+ESP32S3_LP_FILTER filtro_inversor_vib; 
+ESP32S3_NOTCH_FILTER filtro_rede_corr; 
 
-ESP32S3_LP_FILTER filtro_inversor_vib; // Passa-baixa para ruído do inversor
-ESP32S3_NOTCH_FILTER filtro_rede_corr; // Notch para remover o zumbido de 60Hz da rede
-
-// Buffers para Vibração
+// --- Ponteiros de Memória (PSRAM) ---
 float *vib_dado_sujo;     
 float *vib_dado_limpo;    
 float *vib_espetro_ia;  
 
-// Buffers para Corrente
 float *corr_dado_sujo;    
 float *corr_dado_limpo;   
 float *corr_espetro_ia; 
@@ -27,16 +30,19 @@ float *corr_espetro_ia;
 void setup(void) {
   Serial.begin(115200);
   vTaskDelay(100); 
+  
+  pinMode(PINO_SENSOR_CORRENTE, INPUT);
 
-  // Inicializa os filtros (Frequência alvo, taxa de amostragem, atenuação, fator Q)
+  // Inicialização matemática dos filtros
+  // O passa-baixa corta ruídos de chaveamento PWM acima de 1000Hz.
+  // O Notch cria um entalhe profundo em 60Hz para isolar falhas mecânicas na corrente.
   filtro_inversor_vib.init(1000.0, TAXA_AMOSTRAGEM, 0.707);
   filtro_rede_corr.init(60.0, TAXA_AMOSTRAGEM, -40.0, 0.707);
 
-  // Prepara a FFT usando média espectral (ideal para suavizar dados para a IA)
   fft_table_t *tabela_vib = fft_vibracao.init(FFT_SIZE, FFT_SAMPLES, SPECTRAL_AVERAGE);
   fft_table_t *tabela_corr = fft_corrente.init(FFT_SIZE, FFT_SAMPLES, SPECTRAL_AVERAGE);
 
-  // Aloca os buffers na PSRAM para não travar a memória interna do ESP32-S3
+  // Alocação de memória externa para evitar estouro da RAM interna do ESP32-S3
   vib_dado_sujo  = (float *)heap_caps_malloc((tabela_vib->size_input_bufr * sizeof(float)), MALLOC_CAP_SPIRAM);
   vib_dado_limpo = (float *)heap_caps_malloc((tabela_vib->size_input_bufr * sizeof(float)), MALLOC_CAP_SPIRAM);
   vib_espetro_ia = (float *)heap_caps_malloc((FFT_SIZE * sizeof(float)), MALLOC_CAP_SPIRAM);
@@ -45,28 +51,50 @@ void setup(void) {
   corr_dado_limpo = (float *)heap_caps_malloc((tabela_corr->size_input_bufr * sizeof(float)), MALLOC_CAP_SPIRAM);
   corr_espetro_ia = (float *)heap_caps_malloc((FFT_SIZE * sizeof(float)), MALLOC_CAP_SPIRAM);
 
-  // Trava o sistema num loop infinito caso a placa falhe ao alocar a PSRAM
   if (!vib_dado_sujo || !corr_dado_sujo) {
-    while(true) { vTaskDelay(10); } 
+    while(true) { vTaskDelay(10); } // Trava de segurança
   }
 }
 
 void loop(void) {
-  // 1. Leitura dos sensores
+  
+  // Fase 1: Aquisição Sincronizada
+  // Enchemos o buffer de 1024 posições respeitando rigorosamente o relógio de 4000 Hz.
   for(int i = 0; i < FFT_SAMPLES; i++) {
-     vib_dado_sujo[i] = 0.0f;  // Substituir pela leitura real do acelerômetro
-     corr_dado_sujo[i] = 0.0f; // Substituir pela leitura real do sensor de corrente
+     
+     // Marcamos no relógio interno do processador o exato momento em que a leitura começou
+     unsigned long tempo_inicio_leitura = micros();
+
+     // Leitura 1: Vibração
+     // Aqui você chamará a função da biblioteca do seu acelerómetro (ex: ler o eixo Z via I2C)
+     // vib_dado_sujo[i] = mpu.getAccelerationZ(); 
+     vib_dado_sujo[i] = 0.0f; // Placeholder
+     
+     // Leitura 2: Corrente Elétrica
+     // O conversor ADC lê um valor de 0 a 4095. Numa aplicação real industrial, 
+     // você multiplicaria este valor pelo fator de conversão do seu circuito condicionador.
+     corr_dado_sujo[i] = analogRead(PINO_SENSOR_CORRENTE); 
+
+     // Sincronização: O ESP32 é muito rápido e faz a leitura em poucos microssegundos.
+     // Este loop "while" prende o processador até que se completem exatamente os 250 microssegundos 
+     // necessários para manter a taxa de 4000 Hz, garantindo a integridade do domínio da frequência.
+     while (micros() - tempo_inicio_leitura < PERIODO_AMOSTRAGEM_US) {
+        // Aguarda
+     }
   }
 
-  // 2. Aplicação dos filtros para limpar os dados em tempo real
+  // Fase 2: Condicionamento de Sinal (Filtragem)
+  // Passamos os vetores com o sinal bruto e ruidoso pelas funções de filtro.
+  // O resultado limpo é guardado nos vetores '_dado_limpo'.
   filtro_inversor_vib.apply(vib_dado_sujo, vib_dado_limpo, FFT_SAMPLES);
   filtro_rede_corr.apply(corr_dado_sujo, corr_dado_limpo, FFT_SAMPLES);
 
-  // 3. Execução da FFT para extrair as frequências do sinal limpo
+  // Fase 3: Processamento DSP (Transformada de Fourier)
+  // Converte a série temporal filtrada num espetro de frequências.
+  // Cada posição do vetor final representa a amplitude de uma frequência específica.
   fft_vibracao.compute(vib_dado_limpo, vib_espetro_ia);
   fft_corrente.compute(corr_dado_limpo, corr_espetro_ia);
   
-  // Os vetores 'vib_espetro_ia' e 'corr_espetro_ia' estão prontos para a IA
-  
-  vTaskDelay(pdMS_TO_TICKS(2000)); // Aguarda 2 segundos até o próximo ciclo
+  // Pausa de 1 segundo antes de recolher o próximo lote de dados do motor
+  vTaskDelay(pdMS_TO_TICKS(1000)); 
 }
